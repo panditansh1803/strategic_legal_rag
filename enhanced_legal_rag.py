@@ -20,6 +20,10 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 import openai
 from openai import OpenAI
+import aiohttp
+import asyncio
+import google.generativeai as genai
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 import google.generativeai as genai
 
 # Document processing
@@ -137,7 +141,30 @@ class ComprehensiveLegalAnswer:
     follow_up_questions: List[str]
     fact_check_status: str
     last_updated: str
-
+async def query_perplexity(prompt: str, model: str = "llama-3.1-sonar-large-32k-online") -> str:
+    """Query Perplexity API with online search capabilities for legal research."""
+    url = "https://api.perplexity.ai/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {os.getenv('PERPLEXITY_API_KEY')}",
+        "Content-Type": "application/json"
+    }
+    payload = {
+        "model": model,  # Online model for real-time legal searches; alt: 'mixtral-8x7b-instruct' for offline
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 2000,  # Sufficient for detailed legal answers
+        "stream": False
+    }
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, headers=headers, json=payload) as response:
+            if response.status == 200:
+                data = await response.json()
+                return data['choices'][0]['message']['content']
+            elif response.status == 429:
+                raise Exception("Perplexity API rate limit exceeded. Wait and retry.")
+            else:
+                raise Exception(f"Perplexity API error: {response.status} - {await response.text()}")
+            
 class AdvancedDocumentProcessor:
     """Enhanced document processor with AI-powered analysis"""
     
@@ -697,46 +724,34 @@ class UltimateLegalAnalyzer:
         except Exception as e:
             logger.error(f"Error initializing LLM: {e}")
             raise
-    
-    def query_llm(self, prompt: str, max_retries: int = 3) -> str:
-        """Query the selected LLM with retry logic"""
-        for attempt in range(max_retries):
+    def query_llm(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -> str:
+        """LLM query using Perplexity first, then Gemini fallback, with retries."""
+        for attempt in range(3):  # Retry up to 3 times
             try:
-                if self.llm_provider == "perplexity":
-                    response = self.perplexity_client.chat.completions.create(
-                        model="llama-3.1-sonar-large-128k-online",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        max_tokens=4000
-                    )
-                    return response.choices[0].message.content
-                    
-                elif self.llm_provider == "gemini":
-                    response = self.llm_model.generate_content(
-                        prompt,
-                        generation_config=genai.types.GenerationConfig(
-                            temperature=0.1,
-                            max_output_tokens=4000
-                        )
-                    )
-                    return response.text
-                    
-                elif self.llm_provider == "openai":
-                    response = self.openai_client.chat.completions.create(
-                        model="gpt-4",
-                        messages=[{"role": "user", "content": prompt}],
-                        temperature=0.1,
-                        max_tokens=4000
-                    )
-                    return response.choices[0].message.content
-                    
+                # Primary: Perplexity (run async function synchronously)
+                loop = asyncio.get_event_loop()
+                return loop.run_until_complete(query_perplexity(prompt))
             except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                    continue
-                else:
-                    return f"Error querying LLM after {max_retries} attempts: {str(e)}"
+                logger.warning(f"Perplexity failed (attempt {attempt+1}): {e}")
+                    
+            try:
+                # Fallback: Gemini
+                model = genai.GenerativeModel('gemini-1.5-flash')  # Fast/cheap; use 'gemini-1.5-pro' for complex legal analysis
+                response = model.generate_content(prompt)
+                return response.text
+            except Exception as e:
+                logger.warning(f"Gemini failed (attempt {attempt+1}): {e}")
+        
+            time.sleep(2 ** attempt)  # Exponential backoff (2s, 4s, 8s)
     
+        raise Exception("Both Perplexity and Gemini failed after retries. Check API keys, network, or rate limits.")
+    
+    prompt = f"""
+    Search legal databases and sites (e.g., Indian Kanoon, SCC Online) for: {legal_query}
+    Jurisdiction: {jurisdiction}
+    Legal Area: {legal_area}
+    Provide: Case analysis, similar cases with winning strategies, statutes, and advice for law students.
+    """
     async def ultimate_legal_query(self, question: str, context: str = "", 
                                  jurisdiction: str = "auto", 
                                  urgency: str = "normal") -> ComprehensiveLegalAnswer:
