@@ -20,10 +20,6 @@ import pandas as pd
 from sentence_transformers import SentenceTransformer
 import openai
 from openai import OpenAI
-import aiohttp
-import asyncio
-import google.generativeai as genai
-genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 import google.generativeai as genai
 
 # Document processing
@@ -141,6 +137,7 @@ class ComprehensiveLegalAnswer:
     follow_up_questions: List[str]
     fact_check_status: str
     last_updated: str
+
 async def query_perplexity(prompt: str, model: str = "llama-3.1-sonar-large-32k-online") -> str:
     """Query Perplexity API with online search capabilities for legal research."""
     url = "https://api.perplexity.ai/chat/completions"
@@ -149,22 +146,32 @@ async def query_perplexity(prompt: str, model: str = "llama-3.1-sonar-large-32k-
         "Content-Type": "application/json"
     }
     payload = {
-        "model": model,  # Online model for real-time legal searches; alt: 'mixtral-8x7b-instruct' for offline
+        "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0.7,
-        "max_tokens": 2000,  # Sufficient for detailed legal answers
+        "max_tokens": 2000,
         "stream": False
     }
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, json=payload) as response:
-            if response.status == 200:
-                data = await response.json()
-                return data['choices'][0]['message']['content']
-            elif response.status == 429:
-                raise Exception("Perplexity API rate limit exceeded. Wait and retry.")
-            else:
-                raise Exception(f"Perplexity API error: {response.status} - {await response.text()}")
-            
+    for attempt in range(3):  # Retry up to 3 times
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, headers=headers, json=payload, timeout=30) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data['choices'][0]['message']['content']
+                    elif response.status == 429:
+                        wait_time = 2 ** attempt  # Exponential backoff
+                        logger.warning(f"Rate limit exceeded, retrying in {wait_time}s...")
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise Exception(f"Perplexity API error: {response.status} - {await response.text()}")
+        except Exception as e:
+            logger.error(f"Perplexity attempt {attempt+1} failed: {e}")
+            if attempt == 2:
+                raise Exception(f"Perplexity API failed after 3 attempts: {e}")
+            await asyncio.sleep(2 ** attempt)
+    raise Exception("Perplexity API unreachable after retries")
+
 class AdvancedDocumentProcessor:
     """Enhanced document processor with AI-powered analysis"""
     
@@ -199,13 +206,21 @@ class AdvancedDocumentProcessor:
         self.legal_terminology = self._load_legal_terminology()
     
     def _init_nlp_models(self):
-        """Initialize NLP models"""
+        """Initialize NLP models with basic text processing fallback."""
         models = {}
         try:
             models['spacy'] = spacy.load("en_core_web_sm")
         except:
-            logger.warning("spaCy model not found. Some NLP features limited.")
+            logger.warning("spaCy model not found. Falling back to basic text processing.")
             models['spacy'] = None
+            # Initialize basic regex-based entity extraction
+            models['basic'] = {
+                'entity_patterns': {
+                    'PERSON': r'[A-Z][a-z]+ [A-Z][a-z]+',
+                    'ORG': r'[A-Z][a-zA-Z\s&]+(Inc\.|Ltd\.|LLC|PLC|Court|Tribunal)',
+                    'GPE': r'[A-Z][a-z]+(?: [A-Z][a-z]+)?'
+                }
+            }
         return models
     
     def _init_summarizer(self):
@@ -258,10 +273,17 @@ class AdvancedDocumentProcessor:
         """Enhanced PDF extraction with metadata and structure analysis"""
         try:
             # Try advanced extraction first, fallback to basic
-            text = self.extract_text_from_pdf(file_path)
-            if not text and file_path.endswith('.docx'):
+            file_extension = Path(file_path).suffix.lower()
+            if file_extension == '.pdf':
+                text = self.extract_text_from_pdf(file_path)
+            elif file_extension == '.docx':
                 text = self.extract_text_from_docx(file_path)
-            
+            elif file_extension == '.txt':
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    text = f.read()
+            else:
+                text = ""
+
             extraction_result = {
                 'text': text,
                 'metadata': {'file_name': os.path.basename(file_path)},
@@ -323,23 +345,26 @@ class AdvancedDocumentProcessor:
         return unique_citations[:10]  # Limit to top 10
     
     def _detect_jurisdiction_advanced(self, text: str) -> str:
-        """Advanced jurisdiction detection"""
+        """Advanced jurisdiction detection with weighted scoring."""
         text_lower = text.lower()
-        
         jurisdiction_indicators = {
-            'india': ['supreme court of india', 'high court', 'indian', 'constitution of india', 'air', 'scc'],
-            'us': ['u.s. supreme court', 'federal court', 'united states', 'f.supp', 'f.2d'],
-            'uk': ['house of lords', 'court of appeal', 'england', 'wales', 'ukhl', 'ewca'],
-            'canada': ['supreme court of canada', 'federal court of canada'],
-            'australia': ['high court of australia', 'federal court of australia']
+            'india': ['supreme court of india', 'high court', 'indian', 'constitution of india', 'air', 'scc', 'delhi', 'mumbai'],
+            'us': ['u.s. supreme court', 'federal court', 'united states', 'f.supp', 'f.2d', 'california', 'new york'],
+            'uk': ['house of lords', 'court of appeal', 'england', 'wales', 'ukhl', 'ewca', 'london'],
+            'canada': ['supreme court of canada', 'federal court of canada', 'ontario', 'quebec'],
+            'australia': ['high court of australia', 'federal court of australia', 'sydney', 'melbourne']
         }
-        
-        for jurisdiction, indicators in jurisdiction_indicators.items():
-            if any(indicator in text_lower for indicator in indicators):
-                return jurisdiction
-        
-        return 'india'  # Default to India
-    
+        scores = {jur: 0 for jur in jurisdiction_indicators}
+        for jur, indicators in jurisdiction_indicators.items():
+            for indicator in indicators:
+                if indicator in text_lower:
+                    # Weight more specific indicators (e.g., court names) higher
+                    weight = 2 if any(court in indicator for court in ['court', 'scc', 'f.supp', 'ukhl']) else 1
+                    scores[jur] += weight
+        # Return jurisdiction with highest score, or 'Unknown' if no indicators found
+        max_jur = max(scores, key=scores.get, default='Unknown')
+        return max_jur if scores[max_jur] > 0 else 'Unknown'
+
     def _classify_citation_type(self, citation: str) -> str:
         """Classify the type of legal citation"""
         if any(term in citation.upper() for term in ['SC', 'SUPREME']):
@@ -463,17 +488,19 @@ class EnhancedWebLegalSearcher:
         }
     
     async def parallel_search_all_databases(self, query: str, jurisdiction: str = "all") -> List[Dict]:
-        """Search multiple legal databases"""
+        """Search multiple legal databases with rate limiting"""
         all_results = []
         
         # Search IndianKanoon for Indian cases
         if jurisdiction.lower() in ['india', 'all']:
             ik_results = self._search_indiankanoon_enhanced(query)
             all_results.extend(ik_results)
+            await asyncio.sleep(1)  # Rate limiting delay
         
         # Search Google Scholar
         scholar_results = self._search_google_scholar(query)
         all_results.extend(scholar_results)
+        await asyncio.sleep(1)
         
         # Search legal news
         news_results = self._search_legal_news(query)
@@ -641,22 +668,23 @@ class UltimateLegalAnalyzer:
         self.document_count = 0
     
     def _init_collections(self) -> Dict[str, Any]:
-        """Initialize specialized vector collections"""
+        """Initialize specialized vector collections with error handling."""
         collections = {}
-        
         collection_types = ['cases', 'statutes', 'general']
-        
-        for col_type in collection_types:
-            try:
-                collections[col_type] = self.chroma_client.get_collection(f"legal_{col_type}")
-            except:
-                collections[col_type] = self.chroma_client.create_collection(
-                    name=f"legal_{col_type}",
-                    metadata={"hnsw:space": "cosine"}
-                )
-        
+        try:
+            for col_type in collection_types:
+                try:
+                    collections[col_type] = self.chroma_client.get_collection(f"legal_{col_type}")
+                except:
+                    collections[col_type] = self.chroma_client.create_collection(
+                        name=f"legal_{col_type}",
+                        metadata={"hnsw:space": "cosine"}
+                    )
+        except Exception as e:
+            logger.error(f"ChromaDB initialization error: {e}")
+            raise Exception("Failed to initialize vector database. Check ChromaDB configuration.")
         return collections
-    
+
     def _init_local_database(self):
         """Initialize local SQLite database"""
         conn = sqlite3.connect('legal_knowledge.db', check_same_thread=False)
@@ -724,13 +752,13 @@ class UltimateLegalAnalyzer:
         except Exception as e:
             logger.error(f"Error initializing LLM: {e}")
             raise
+    
     def query_llm(self, prompt: str, max_tokens: int = 2000, temperature: float = 0.7) -> str:
         """LLM query using Perplexity first, then Gemini fallback, with retries."""
         for attempt in range(3):  # Retry up to 3 times
             try:
                 # Primary: Perplexity (run async function synchronously)
-                loop = asyncio.get_event_loop()
-                return loop.run_until_complete(query_perplexity(prompt))
+                return asyncio.run(query_perplexity(prompt))
             except Exception as e:
                 logger.warning(f"Perplexity failed (attempt {attempt+1}): {e}")
                     
@@ -745,18 +773,12 @@ class UltimateLegalAnalyzer:
             time.sleep(2 ** attempt)  # Exponential backoff (2s, 4s, 8s)
     
         raise Exception("Both Perplexity and Gemini failed after retries. Check API keys, network, or rate limits.")
-    
-    prompt = f"""
-    Search legal databases and sites (e.g., Indian Kanoon, SCC Online) for: {legal_query}
-    Jurisdiction: {jurisdiction}
-    Legal Area: {legal_area}
-    Provide: Case analysis, similar cases with winning strategies, statutes, and advice for law students.
-    """
+
+    @lru_cache(maxsize=100)
     async def ultimate_legal_query(self, question: str, context: str = "", 
                                  jurisdiction: str = "auto", 
                                  urgency: str = "normal") -> ComprehensiveLegalAnswer:
-        """Ultimate legal query processing with comprehensive analysis"""
-        
+        """Ultimate legal query processing with comprehensive analysis and caching"""
         start_time = time.time()
         
         # Step 1: Question analysis
@@ -765,6 +787,7 @@ class UltimateLegalAnalyzer:
         # Step 2: Auto-detect jurisdiction if needed
         if jurisdiction == "auto":
             jurisdiction = self._detect_jurisdiction_from_question(question, context)
+        question_analysis['jurisdiction'] = jurisdiction
         
         # Step 3: Multi-source information gathering
         search_results = await self._comprehensive_information_gathering(
@@ -802,22 +825,9 @@ class UltimateLegalAnalyzer:
         }
         
         # Detect legal area
-        legal_area_keywords = {
-            'Constitutional Law': ['constitution', 'fundamental rights', 'judicial review'],
-            'Criminal Law': ['criminal', 'prosecution', 'defense', 'evidence'],
-            'Corporate Law': ['company', 'corporate', 'securities', 'merger'],
-            'Contract Law': ['contract', 'agreement', 'breach', 'performance'],
-            'Tort Law': ['negligence', 'liability', 'damages', 'injury'],
-            'Property Law': ['property', 'real estate', 'ownership', 'title'],
-            'Employment Law': ['employment', 'labor', 'workplace', 'discrimination'],
-            'Tax Law': ['tax', 'taxation', 'revenue', 'deduction'],
-            'Environmental Law': ['environment', 'pollution', 'climate', 'conservation'],
-            'Intellectual Property': ['patent', 'trademark', 'copyright', 'IP']
-        }
-        
         question_lower = question.lower() + ' ' + context.lower()
         
-        for area, keywords in legal_area_keywords.items():
+        for area, keywords in LEGAL_AREAS.items():
             if any(keyword in question_lower for keyword in keywords):
                 analysis['legal_area'] = area
                 break
@@ -943,7 +953,6 @@ class UltimateLegalAnalyzer:
     async def _advanced_legal_analysis(self, question: str, context: str, 
                                      search_results: Dict, question_analysis: Dict) -> Dict:
         """Advanced legal analysis using AI"""
-        
         analysis_result = {
             'primary_legal_issues': [],
             'applicable_laws': [],
@@ -968,6 +977,11 @@ class UltimateLegalAnalyzer:
             Question: {question}
             Context: {context}
             Legal Area: {question_analysis['legal_area']}
+
+            Instructions:
+            1. Ensure factual accuracy and cite only verifiable legal principles.
+            2. If jurisdiction is unclear, provide general principles and note limitations.
+            3. Avoid speculation; base analysis on established law.
             
             Provide analysis including:
             1. Primary legal issues
@@ -1000,6 +1014,12 @@ class UltimateLegalAnalyzer:
             Available Sources:
             {chr(10).join(formatted_sources)}
             
+            Instructions:
+            1. Ensure factual accuracy by cross-referencing sources with {question_analysis.get('jurisdiction') or 'applicable'} legal standards.
+            2. Prioritize binding precedents and statutes from the relevant jurisdiction.
+            3. Clearly distinguish between binding and persuasive authority.
+            4. Avoid speculation; if sources are insufficient, note limitations and suggest general principles.
+            
             Provide comprehensive analysis including:
             
             ## PRIMARY LEGAL ISSUES
@@ -1022,7 +1042,7 @@ class UltimateLegalAnalyzer:
             - Recommended course of action
             - Alternative approaches to consider
             
-            Focus on providing actionable, practical advice.
+            Focus on providing actionable, practical advice aligned with {question_analysis.get('jurisdiction') or 'applicable'} law.
             """
         
         # Get analysis from LLM
@@ -1188,23 +1208,30 @@ class UltimateLegalAnalyzer:
             logger.error(f"Query logging error: {e}")
     
     def add_document(self, file_path: str) -> str:
-        """Add a legal document to the knowledge base"""
+        """Add a legal document to the knowledge base with enhanced error handling."""
         try:
-            # Extract content based on file type
             file_extension = Path(file_path).suffix.lower()
+            if file_extension not in ['.pdf', '.docx', '.txt']:
+                return f"Unsupported file type: {file_extension}. Supported types: PDF, DOCX, TXT"
             
+            # Check file size (limit to 10MB)
+            if os.path.getsize(file_path) > 10 * 1024 * 1024:
+                return "File too large. Maximum size is 10MB."
+
+            # Extract content based on file type
             if file_extension == '.pdf':
                 content = self.document_processor.extract_text_from_pdf(file_path)
             elif file_extension == '.docx':
                 content = self.document_processor.extract_text_from_docx(file_path)
-            elif file_extension == '.txt':
+            else:  # .txt
                 with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                     content = f.read()
-            else:
-                return f"Unsupported file type: {file_extension}"
             
             if not content.strip():
                 return "No text content found in document"
+            
+            # Truncate content if too large (e.g., for embedding)
+            content = content[:100000]  # Limit to 100k characters
             
             # Enhanced document analysis
             analysis = self.document_processor.enhanced_pdf_extraction(file_path)
@@ -1245,6 +1272,7 @@ class UltimateLegalAnalyzer:
             return f"Successfully added: {file_name} ({len(content)} chars, {len(analysis.get('citations', []))} citations)"
             
         except Exception as e:
+            logger.error(f"Document processing error: {str(e)}")
             return f"Error processing document: {str(e)}"
     
     def _classify_document_type(self, content: str) -> str:
@@ -1390,14 +1418,25 @@ def create_ultimate_legal_app():
                     help="Perplexity recommended for real-time legal research"
                 )
                 
+                # Validate API keys before initialization
+                api_keys = {
+                    'perplexity': os.getenv('PERPLEXITY_API_KEY'),
+                    'gemini': os.getenv('GOOGLE_API_KEY'),
+                    'openai': os.getenv('OPENAI_API_KEY')
+                }
+                
+                if not api_keys.get(llm_provider):
+                    st.error(f"❌ Missing API key for {llm_provider.title()}. Please add it to the .env file.")
+                    st.stop()
+                
                 st.session_state.ultimate_analyzer = UltimateLegalAnalyzer(llm_provider)
                 st.success(f"✅ System initialized with {llm_provider.title()}")
                 
             except Exception as e:
                 st.error(f"❌ Initialization error: {e}")
-                st.info("💡 Please check your API keys in the .env file")
+                st.info("💡 Please check your API keys in the .env file and ensure all dependencies are installed.")
                 st.stop()
-    
+
     # Sidebar
     with st.sidebar:
         st.header("🔧 System Configuration")
@@ -1474,7 +1513,8 @@ def create_ultimate_legal_app():
                 progress = (i + 1) / len(uploaded_files)
                 upload_progress.progress(progress)
             
-            st.rerun()
+            # This would cause a double-run, better to manage state without it
+            # st.rerun() 
         
         # Database Stats
         st.subheader("📊 Database Statistics")
@@ -1505,32 +1545,34 @@ def create_ultimate_legal_app():
         col1, col2 = st.columns([3, 1])
         
         with col1:
+            # Handle auto-fill from follow-up questions
+            if 'auto_fill_question' in st.session_state:
+                legal_question_value = st.session_state.auto_fill_question
+                context_info_value = st.session_state.auto_fill_context
+                del st.session_state.auto_fill_question
+                del st.session_state.auto_fill_context
+            else:
+                legal_question_value = ""
+                context_info_value = ""
+
             legal_question = st.text_area(
                 "**Your Legal Question**",
+                value=legal_question_value,
                 placeholder="""Ask any legal question, for example:
 • What are my rights if my employer terminates me without notice?
 • Can I sue for breach of contract if the other party fails to deliver?
-• What's the procedure to file a patent application in India?
-• How do I respond to a legal notice for defamation?
-• What are the tax implications of selling inherited property?
-• Can artificial intelligence be held liable for damages?
-• What are the steps to incorporate a company in India?
-• How to handle intellectual property disputes internationally?
-• What constitutes criminal negligence in medical practice?
-• What are international treaty obligations for climate change?""",
+• What's the procedure to file a patent application in India?""",
                 height=120,
                 help="Ask any legal question from basic to complex"
             )
             
             context_info = st.text_area(
                 "**Additional Context (Optional)**",
+                value=context_info_value,
                 placeholder="""Provide relevant background:
 • Specific facts of your situation
 • Timeline of events
-• Parties involved
-• Evidence available
-• Previous legal actions
-• Location/jurisdiction""",
+• Parties involved""",
                 height=80
             )
         
@@ -1563,12 +1605,10 @@ def create_ultimate_legal_app():
         if st.button("🔍 Get Comprehensive Legal Answer", type="primary", use_container_width=True):
             if legal_question.strip():
                 with st.spinner("🤖 AI Legal Assistant analyzing your question..."):
-                    # Progress indicators
                     progress_bar = st.progress(0)
                     status_text = st.empty()
                     
                     try:
-                        # Analysis steps
                         status_text.text("📝 Analyzing your question...")
                         progress_bar.progress(20)
                         
@@ -1581,16 +1621,10 @@ def create_ultimate_legal_app():
                         status_text.text("✅ Generating comprehensive answer...")
                         progress_bar.progress(80)
                         
-                        # Process query
                         jurisdiction = "auto" if question_jurisdiction == "Auto-detect" else question_jurisdiction
                         urgency = urgency_level.split("/")[0].lower()
                         
-                        # Use asyncio to run the async function
-                        import asyncio
-                        loop = asyncio.new_event_loop()
-                        asyncio.set_event_loop(loop)
-                        
-                        comprehensive_answer = loop.run_until_complete(
+                        comprehensive_answer = asyncio.run(
                             st.session_state.ultimate_analyzer.ultimate_legal_query(
                                 legal_question,
                                 context_info,
@@ -1599,45 +1633,24 @@ def create_ultimate_legal_app():
                             )
                         )
                         
-                        loop.close()
-                        
                         progress_bar.progress(100)
                         status_text.text("✅ Analysis complete!")
-                        
                         time.sleep(1)
                         status_text.empty()
                         progress_bar.empty()
                         
                         # Display results
-                        st.markdown("---")
                         st.subheader("📋 Comprehensive Legal Analysis")
                         
-                        # Confidence and metrics
                         col1, col2, col3 = st.columns(3)
-                        
                         with col1:
                             confidence = comprehensive_answer.confidence_score
                             if confidence >= 0.8:
-                                st.markdown("""
-                                <div class="confidence-high">
-                                    🟢 <strong>High Confidence</strong><br>
-                                    Confidence: {:.1%}
-                                </div>
-                                """.format(confidence), unsafe_allow_html=True)
+                                st.markdown(f'<div class="confidence-high">🟢 <strong>High Confidence</strong><br>Confidence: {confidence:.1%}</div>', unsafe_allow_html=True)
                             elif confidence >= 0.6:
-                                st.markdown("""
-                                <div class="confidence-medium">
-                                    🟡 <strong>Medium Confidence</strong><br>
-                                    Confidence: {:.1%}
-                                </div>
-                                """.format(confidence), unsafe_allow_html=True)
+                                st.markdown(f'<div class="confidence-medium">🟡 <strong>Medium Confidence</strong><br>Confidence: {confidence:.1%}</div>', unsafe_allow_html=True)
                             else:
-                                st.markdown("""
-                                <div class="confidence-low">
-                                    🔴 <strong>Low Confidence</strong><br>
-                                    Confidence: {:.1%}
-                                </div>
-                                """.format(confidence), unsafe_allow_html=True)
+                                st.markdown(f'<div class="confidence-low">🔴 <strong>Low Confidence</strong><br>Confidence: {confidence:.1%}</div>', unsafe_allow_html=True)
                         
                         with col2:
                             st.metric("Legal Area", comprehensive_answer.legal_area)
@@ -1645,196 +1658,140 @@ def create_ultimate_legal_app():
                         with col3:
                             st.metric("Jurisdiction", comprehensive_answer.jurisdiction)
                         
-                        # Main answer
-                        st.markdown(f"""
-                        <div class="answer-section">
-                            <h4>🎯 Legal Analysis & Answer</h4>
-                            {comprehensive_answer.answer}
-                        </div>
-                        """, unsafe_allow_html=True)
+                        st.markdown(f'<div class="answer-section"><h4>🎯 Legal Analysis & Answer</h4>{comprehensive_answer.answer}</div>', unsafe_allow_html=True)
                         
-                        # Additional analysis sections
                         if include_analysis:
                             col1, col2 = st.columns(2)
-                            
                             with col1:
-                                # Success analysis
                                 if comprehensive_answer.success_probability:
                                     with st.expander("📊 Success Analysis", expanded=True):
                                         success_prob = comprehensive_answer.success_probability
-                                        
-                                        st.markdown(f"""
-                                        <div class="success-metric">
-                                            <h3>{success_prob}%</h3>
-                                            <p>Estimated Success Rate</p>
-                                        </div>
-                                        """, unsafe_allow_html=True)
-                                        
+                                        st.markdown(f'<div class="success-metric"><h3>{success_prob}%</h3><p>Estimated Success Rate</p></div>', unsafe_allow_html=True)
                                         if comprehensive_answer.potential_challenges:
                                             st.write("**⚠️ Potential Challenges:**")
                                             for challenge in comprehensive_answer.potential_challenges[:3]:
                                                 st.write(f"• {challenge}")
-                                
-                                # Procedural requirements
                                 if comprehensive_answer.procedural_requirements:
-                                    with st.expander("📋 Procedural Requirements", expanded=False):
+                                    with st.expander("📋 Procedural Requirements"):
                                         for req in comprehensive_answer.procedural_requirements:
                                             st.write(f"✓ {req}")
-                            
                             with col2:
-                                # Cost estimates
                                 if include_costs and comprehensive_answer.cost_estimates:
                                     with st.expander("💰 Cost Estimates", expanded=True):
                                         costs = comprehensive_answer.cost_estimates
                                         st.write(f"**💵 Low-end:** ₹{costs.get('low', 5000):,}")
                                         st.write(f"**💰 Mid-range:** ₹{costs.get('medium', 15000):,}")
                                         st.write(f"**💎 High-end:** ₹{costs.get('high', 50000):,}")
-                                
-                                # Timeline
                                 if comprehensive_answer.timeline_estimates:
-                                    with st.expander("⏰ Timeline Estimates", expanded=False):
+                                    with st.expander("⏰ Timeline Estimates"):
                                         timeline = comprehensive_answer.timeline_estimates
                                         for phase, duration in timeline.items():
                                             st.write(f"**{phase.title()}:** {duration}")
                         
-                        # Expert recommendations
                         if comprehensive_answer.expert_recommendations:
                             st.markdown("### 💡 Expert Recommendations")
                             for i, rec in enumerate(comprehensive_answer.expert_recommendations, 1):
                                 st.success(f"**{i}.** {rec}")
                         
-                        # Alternative approaches
                         if comprehensive_answer.alternative_approaches:
-                            with st.expander("🔄 Alternative Approaches", expanded=False):
+                            with st.expander("🔄 Alternative Approaches"):
                                 for i, approach in enumerate(comprehensive_answer.alternative_approaches, 1):
                                     st.info(f"**Option {i}:** {approach}")
                         
-                        # Follow-up questions
                         if comprehensive_answer.follow_up_questions:
                             st.markdown("### 🤔 Related Questions You Might Ask")
-                            
                             cols = st.columns(2)
                             for i, question in enumerate(comprehensive_answer.follow_up_questions):
-                                col = cols[i % 2]
-                                with col:
+                                with cols[i % 2]:
                                     if st.button(f"❓ {question}", key=f"followup_{i}"):
                                         st.session_state['new_question'] = question
+                                        st.session_state['new_context'] = comprehensive_answer.answer[:500]
                                         st.rerun()
                         
-                        # Fact-check status
                         if comprehensive_answer.fact_check_status:
-                            if comprehensive_answer.fact_check_status == 'verified':
-                                st.success("✅ Information verified across multiple sources")
-                            else:
-                                st.warning("⚠️ Limited verification - additional consultation recommended")
+                            st.success("✅ Information verified across multiple sources") if comprehensive_answer.fact_check_status == 'verified' else st.warning("⚠️ Limited verification - additional consultation recommended")
                         
-                        # Save for reference
                         st.session_state['last_answer'] = comprehensive_answer
                         
                     except Exception as e:
                         st.error(f"❌ Error processing question: {str(e)}")
                         st.info("💡 Please try rephrasing your question or check your API keys")
-                        logger.error(f"Question processing error: {e}")
+                        logger.error(f"Question processing error: {e}", exc_info=True)
             else:
                 st.warning("⚠️ Please enter a legal question to get started")
         
-        # Handle new questions from follow-ups
         if st.session_state.get('new_question'):
             st.info(f"🔄 Processing: {st.session_state['new_question']}")
-            st.session_state['auto_fill_question'] = st.session_state['new_question']
-            del st.session_state['new_question']
+            st.session_state['auto_fill_question'] = st.session_state.pop('new_question')
+            st.session_state['auto_fill_context'] = st.session_state.pop('new_context', '')
             st.rerun()
-    
+
     # Tab 2: Case Research
     with tab2:
         st.header("📚 Advanced Case Research")
         st.markdown("*Find similar cases and analyze legal precedents*")
         
         col1, col2 = st.columns([3, 1])
-        
         with col1:
             case_facts = st.text_area(
                 "**Case Facts**",
                 placeholder="""Describe your case situation:
 • What happened?
 • Who are the parties involved?
-• Timeline of events
-• Damages or disputes
-• Evidence available""",
+• Timeline of events""",
                 height=120
             )
-            
             legal_issues = st.text_area(
                 "**Legal Issues**",
                 placeholder="""What legal questions need resolution:
 • Breach of contract?
 • Negligence claims?
-• Constitutional violations?
-• Statutory interpretations?""",
+• Constitutional violations?""",
                 height=80
             )
-        
         with col2:
             st.subheader("🔍 Search Parameters")
-            
             research_jurisdiction = st.multiselect(
                 "**Jurisdictions**",
                 list(SUPPORTED_JURISDICTIONS.keys()),
                 default=["India"]
             )
-            
             court_levels = st.multiselect(
                 "**Court Levels**",
                 ["Supreme Court", "High Court", "Appeals Court", "District Court"],
                 default=["Supreme Court", "High Court"]
             )
-            
             max_cases = st.slider("**Max Cases**", 5, 25, 10)
         
         if st.button("🔍 Find Similar Cases", type="primary", use_container_width=True):
             if case_facts and legal_issues:
                 with st.spinner("🔍 Searching for similar cases..."):
                     try:
-                        # Search for similar cases (simplified version)
                         search_results = []
-                        
-                        # Use web searcher for demonstration
+                        search_query = f"{case_facts} {legal_issues}"
                         for jurisdiction in research_jurisdiction:
                             web_results = asyncio.run(
                                 st.session_state.ultimate_analyzer.web_searcher.parallel_search_all_databases(
-                                    f"{case_facts} {legal_issues}", jurisdiction.lower()
+                                    search_query, jurisdiction.lower()
                                 )
                             )
                             search_results.extend(web_results[:max_cases//len(research_jurisdiction)])
                         
                         if search_results:
                             st.success(f"✅ Found {len(search_results)} similar cases")
-                            
                             for i, case in enumerate(search_results, 1):
                                 with st.expander(f"📋 Case #{i}: {case.get('title', 'Unknown Case')}", expanded=(i <= 3)):
-                                    col1, col2 = st.columns([2, 1])
-                                    
-                                    with col1:
-                                        st.write("**Summary:**", case.get('snippet', 'No summary available')[:300])
-                                        if case.get('source'):
-                                            st.write("**Source:**", case['source'])
-                                        if case.get('jurisdiction'):
-                                            st.write("**Jurisdiction:**", case['jurisdiction'])
-                                    
-                                    with col2:
-                                        if case.get('url'):
-                                            st.markdown(f"[📖 Read Full Case]({case['url']})")
-                                        
-                                        if st.button(f"📊 Analyze Case #{i}", key=f"analyze_{i}"):
-                                            st.info(f"Analysis feature for Case #{i} - Coming soon!")
+                                    st.write("**Summary:**", case.get('snippet', 'No summary available')[:300])
+                                    st.write(f"**Source:** {case.get('source', 'N/A')} | **Jurisdiction:** {case.get('jurisdiction', 'N/A')}")
+                                    if case.get('url'):
+                                        st.markdown(f"[📖 Read Full Case]({case['url']})")
                         else:
                             st.warning("⚠️ No similar cases found. Try different search terms.")
-                    
                     except Exception as e:
                         st.error(f"❌ Search error: {e}")
             else:
                 st.warning("⚠️ Please provide both case facts and legal issues")
-    
+
     # Tab 3: Document Analysis
     with tab3:
         st.header("📄 AI-Powered Document Analysis")
@@ -1849,78 +1806,35 @@ def create_ultimate_legal_app():
         if doc_files:
             for doc_file in doc_files:
                 st.markdown(f"### 📄 Analyzing: {doc_file.name}")
-                
                 with st.spinner(f"🤖 Analyzing {doc_file.name}..."):
                     try:
-                        # Save temporary file
                         temp_path = f"temp_analysis_{doc_file.name}"
                         with open(temp_path, "wb") as f:
                             f.write(doc_file.getbuffer())
                         
-                        # Analyze document
                         analysis = st.session_state.ultimate_analyzer.document_processor.enhanced_pdf_extraction(temp_path)
-                        
-                        # Clean up
                         os.remove(temp_path)
                         
-                        # Display results
                         col1, col2 = st.columns(2)
-                        
                         with col1:
-                            st.markdown("#### 📊 Document Overview")
                             st.metric("Pages/Sections", analysis.get('page_count', 0))
-                            st.metric("Word Count", len(analysis.get('text', '').split()))
-                            st.metric("Citations", len(analysis.get('citations', [])))
-                            
+                            st.metric("Citations Found", len(analysis.get('citations', [])))
                             if analysis.get('summary'):
                                 st.markdown("#### 📝 Summary")
                                 st.write(analysis['summary'])
-                        
                         with col2:
-                            st.markdown("#### 🔍 Extracted Information")
-                            
-                            # Legal entities
                             entities = analysis.get('legal_entities', {})
                             for entity_type, entity_list in entities.items():
                                 if entity_list:
-                                    st.write(f"**{entity_type.title()}:**")
-                                    for entity in entity_list[:3]:
-                                        st.write(f"• {entity}")
-                            
-                            # Citations
-                            citations = analysis.get('citations', [])
-                            if citations:
-                                st.write("**📖 Citations:**")
-                                for citation in citations[:3]:
-                                    if isinstance(citation, dict):
-                                        st.write(f"• {citation.get('text', citation)}")
-                                    else:
-                                        st.write(f"• {citation}")
-                        
-                        # Full text preview
-                        with st.expander("📄 Document Text Preview", expanded=False):
-                            preview_text = analysis.get('text', '')[:1000]
-                            st.text(preview_text + "..." if len(analysis.get('text', '')) > 1000 else preview_text)
-                    
+                                    st.write(f"**{entity_type.title()}:** " + ", ".join(entity_list[:3]))
+                        with st.expander("📄 Document Text Preview"):
+                            st.text(analysis.get('text', '')[:2000] + "...")
                     except Exception as e:
                         st.error(f"❌ Error analyzing {doc_file.name}: {e}")
         else:
             st.info("📎 Upload legal documents above to start AI analysis")
-            
-            # Show capabilities
-            st.markdown("### 🎯 Analysis Capabilities")
-            capabilities = [
-                "🔍 **Legal Entity Extraction** - Parties, courts, judges",
-                "📖 **Citation Detection** - Legal references and precedents", 
-                "📝 **Document Summarization** - AI-generated summaries",
-                "🏷️ **Document Classification** - Automatic categorization",
-                "📊 **Structure Analysis** - Headers, sections, organization",
-                "🔗 **Cross-Reference Detection** - Related documents and cases"
-            ]
-            
-            for capability in capabilities:
-                st.markdown(capability)
     
+    # ... The rest of the tabs (Analytics, Legal Forms) can remain as they were ...
     # Tab 4: Legal Analytics
     with tab4:
         st.header("📊 Legal Analytics Dashboard")
@@ -2039,60 +1953,33 @@ def create_ultimate_legal_app():
                     
                     # Display document
                     st.markdown("### 📄 Generated Document")
-                    st.markdown("---")
-                    
-                    # Document preview
                     st.markdown(f"""
-                    <div style="background: white; padding: 2rem; border: 1px solid #ddd; border-radius: 10px; font-family: 'Times New Roman', serif; line-height: 1.6;">
+                    <div style="background: white; padding: 1.5rem; border: 1px solid #ddd; border-radius: 5px; font-family: 'Times New Roman', serif; line-height: 1.6;">
                     {generated_doc.replace(chr(10), '<br>')}
                     </div>
                     """, unsafe_allow_html=True)
                     
-                    # Download options
-                    col1, col2, col3 = st.columns(3)
+                    st.download_button(
+                        "📥 Download as Text",
+                        data=generated_doc,
+                        file_name=f"{selected_form.replace(' ', '_')}.txt",
+                        mime="text/plain"
+                    )
                     
-                    with col1:
-                        st.download_button(
-                            "📥 Download as Text",
-                            data=generated_doc,
-                            file_name=f"{selected_form.replace(' ', '_')}.txt",
-                            mime="text/plain"
-                        )
-                    
-                    with col2:
-                        st.info("📄 PDF Export - Premium Feature")
-                    
-                    with col3:
-                        st.info("📝 Word Export - Premium Feature")
-                    
-                    # Document stats
-                    st.markdown("---")
-                    col1, col2, col3 = st.columns(3)
-                    
-                    with col1:
-                        st.metric("Word Count", len(generated_doc.split()))
-                    with col2:
-                        st.metric("Character Count", len(generated_doc))
-                    with col3:
-                        st.metric("Estimated Pages", max(1, len(generated_doc) // 3000))
-                    
-                    # Legal disclaimer
                     st.warning("""
-                    ⚠️ **Legal Disclaimer:** This document is AI-generated and should be reviewed by a qualified attorney before use.
-                    Legal requirements vary by jurisdiction and specific circumstances. This tool does not provide legal advice.
+                    ⚠️ **Legal Disclaimer:** This document is AI-generated and should be reviewed by a qualified attorney before use. This tool does not provide legal advice.
                     """)
                     
                 except Exception as e:
                     st.error(f"❌ Document generation error: {e}")
-    
+
     # Footer
     st.markdown("---")
     st.markdown("""
     <div style="text-align: center; color: #666; margin-top: 2rem;">
-        <p><strong>Ultimate Legal RAG System</strong> - 95% Coverage Legal AI Assistant</p>
-        <p>Powered by Advanced AI • Real-time Research • Professional Analysis</p>
+        <p><strong>Ultimate Legal RAG System</strong> - AI-Powered Legal Assistant</p>
         <p style="font-size: 0.9em;">⚠️ This system provides information and analysis but does not constitute legal advice. 
-        Always consult with qualified legal professionals for specific legal matters.</p>
+        Always consult with qualified legal professionals.</p>
     </div>
     """, unsafe_allow_html=True)
 
@@ -2109,4 +1996,3 @@ if __name__ == "__main__":
         3. Verify internet connection
         4. Try refreshing the page
         """)
-
